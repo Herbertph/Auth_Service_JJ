@@ -1,0 +1,30 @@
+version: "3.9"
+services:
+  auth-db:
+    image: postgres:16
+    container_name: auth_db
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: authuser
+      POSTGRES_PASSWORD: authpass
+    ports:
+      - "5433:5432"
+    volumes:
+      - authdb_data:/var/lib/postgresql/data
+
+  auth-service:
+    build: ./AuthService
+    depends_on: [auth-db]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: "Host=auth-db;Port=5432;Database=authdb;Username=authuser;Password=authpass"
+      Jwt__Issuer: "jj-arena-auth"
+      Jwt__Audience: "jj-arena"
+      Jwt__Key: "change-me-in-prod"
+      Seed__AdminEmail: "admin@jj-arena.com"
+      Seed__AdminPassword: "ChangeMe123!#"
+    ports:
+      - "8081:8080"
+    command: ["dotnet", "AuthService.dll"]
+volumes:
+  authdb_data:
