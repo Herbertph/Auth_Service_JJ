@@ -9,52 +9,103 @@ using AuthService.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// DbContext
+// ---------- DbContext ----------
 var conn = builder.Configuration.GetConnectionString("Default")
            ?? builder.Configuration["ConnectionStrings:Default"];
 builder.Services.AddDbContext<AuthDbContext>(opt => opt.UseNpgsql(conn));
 
-// Options
+// ---------- Options ----------
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
-var jwtOpts = builder.Configuration.GetSection("Jwt").Get<JwtOptions>()!;
-builder.Services.AddSingleton(jwtOpts);
 builder.Services.Configure<SeedOptions>(builder.Configuration.GetSection("Seed"));
 
-// AuthN
+// Bind imediato para usar já na config do Auth (mantém também no DI)
+var jwtOpts = builder.Configuration.GetSection("Jwt").Get<JwtOptions>() ?? new JwtOptions();
+
+// Validação de chave (HS256 exige >= 32 bytes)
+var keyText = jwtOpts.Key ?? string.Empty;
+var keyBytes = Encoding.UTF8.GetBytes(keyText);
+if (keyBytes.Length < 32)
+{
+    throw new InvalidOperationException(
+        $"JWT key too short ({keyBytes.Length} bytes). Set 'Jwt__Key' env var with >= 32 bytes.");
+}
+var signingKey = new SymmetricSecurityKey(keyBytes);
+
+// ---------- AuthN ----------
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
   .AddJwtBearer(opt =>
   {
+      opt.RequireHttpsMetadata = false; // ok para DEV; em PROD use true por padrão
       opt.TokenValidationParameters = new TokenValidationParameters
       {
           ValidateIssuerSigningKey = true,
-          IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOpts.Key)),
-          ValidateIssuer = false,
-          ValidateAudience = false,
-          ValidateLifetime = true
+          IssuerSigningKey = signingKey,
+
+          // Valida Issuer/Audience somente se fornecidos
+          ValidateIssuer = !string.IsNullOrWhiteSpace(jwtOpts.Issuer),
+          ValidIssuer = jwtOpts.Issuer,
+
+          ValidateAudience = !string.IsNullOrWhiteSpace(jwtOpts.Audience),
+          ValidAudience = jwtOpts.Audience,
+
+          ValidateLifetime = true,
+          ClockSkew = TimeSpan.FromSeconds(30)
       };
   });
 
-// AuthZ (policies)
+// ---------- AuthZ ----------
 builder.Services.AddAuthorization(opts =>
 {
     opts.AddPolicy("AdminOnly", p => p.RequireRole(UserRole.Admin.ToString()));
     opts.AddPolicy("OrganizerOrAdmin", p => p.RequireRole(UserRole.Organizer.ToString(), UserRole.Admin.ToString()));
 });
 
+// ---------- CORS (dev) ----------
+builder.Services.AddCors(opts =>
+{
+    opts.AddPolicy("dev", p => p
+        .AllowAnyOrigin()
+        .AllowAnyHeader()
+        .AllowAnyMethod());
+});
+
+// ---------- Swagger ----------
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new OpenApiInfo { Title = "JJ Arena Auth", Version = "v1" });
+    var jwtScheme = new OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header,
+        Description = "Informe: Bearer {seu_token}"
+    };
+    c.AddSecurityDefinition("Bearer", jwtScheme);
+    c.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        [ jwtScheme ] = Array.Empty<string>()
+    });
+});
+
+builder.Services.AddSingleton(jwtOpts);          // para injeção direta de JwtOptions
 builder.Services.AddSingleton<JwtTokenService>();
 
 var app = builder.Build();
 
-// Auto-migrate + seed admin
+// ---------- DB bootstrap (EnsureCreated para destravar agora) ----------
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
-    await db.Database.MigrateAsync();
+
+    // Para DEV inicial. Depois trocar por: await db.Database.MigrateAsync();
+    await db.Database.EnsureCreatedAsync();
 
     var seed = app.Configuration.GetSection("Seed").Get<SeedOptions>();
     if (!string.IsNullOrWhiteSpace(seed?.AdminEmail) && !await db.Users.AnyAsync(u => u.Email == seed.AdminEmail))
@@ -71,23 +122,26 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
+// ---------- Middlewares ----------
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-
+app.UseCors("dev");
 app.UseAuthentication();
 app.UseAuthorization();
 
+// ---------- Health ----------
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/ready", async (AuthDbContext db) =>
+{
+    var canQuery = await db.Database.CanConnectAsync();
+    return canQuery ? Results.Ok(new { ready = true }) : Results.StatusCode(503);
+});
 
-// ==========================
-// 📌 ENDPOINTS
-// ==========================
-
-// 1) Registro público (sempre Bettor)
+// ---------- Endpoints ----------
 app.MapPost("/auth/register", async (RegisterRequest req, AuthDbContext db) =>
 {
     if (await db.Users.AnyAsync(u => u.Email == req.Email || u.Username == req.Username))
@@ -106,8 +160,7 @@ app.MapPost("/auth/register", async (RegisterRequest req, AuthDbContext db) =>
     return Results.Created($"/users/{user.Id}", new { user.Id, user.Email, user.Username, role = user.Role.ToString() });
 });
 
-// 2) Login → devolve accessToken + refreshToken
-app.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenService jwt, JwtOptions jwtOpts) =>
+app.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenService jwt, JwtOptions jwtOptsInjected) =>
 {
     var user = await db.Users
         .FirstOrDefaultAsync(u => u.Email == req.UsernameOrEmail || u.Username == req.UsernameOrEmail);
@@ -117,7 +170,7 @@ app.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenSe
 
     var access = jwt.CreateAccessToken(user);
 
-    // Refresh token seguro: ID + segredo
+    // Refresh token: ID + segredo (hash guardado no banco)
     var tokenId = Guid.NewGuid();
     var secret  = Guid.NewGuid().ToString("N");
     var refreshComposite = $"{tokenId:N}.{secret}";
@@ -127,14 +180,13 @@ app.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenSe
         Id        = tokenId,
         UserId    = user.Id,
         TokenHash = BCrypt.Net.BCrypt.HashPassword(secret),
-        ExpiresAt = DateTime.UtcNow.AddDays(jwtOpts.RefreshTokenDays)
+        ExpiresAt = DateTime.UtcNow.AddDays(jwtOptsInjected.RefreshTokenDays)
     });
     await db.SaveChangesAsync();
 
     return Results.Ok(new AuthResponse(access, refreshComposite));
 });
 
-// 3) Refresh → recebe refreshToken e devolve novo accessToken
 app.MapPost("/auth/refresh", async (string refreshToken, AuthDbContext db, JwtTokenService jwt) =>
 {
     if (string.IsNullOrWhiteSpace(refreshToken)) return Results.Unauthorized();
@@ -159,7 +211,6 @@ app.MapPost("/auth/refresh", async (string refreshToken, AuthDbContext db, JwtTo
     return Results.Ok(new { accessToken = newAccess });
 });
 
-// 4) Me → retorna dados do usuário autenticado
 app.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
 {
     var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -172,7 +223,6 @@ app.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
     return Results.Ok(new { u.Id, u.Email, u.Username, role = u.Role.ToString(), u.CreatedAt });
 }).RequireAuthorization();
 
-// 5) Criar Organizer (somente Admin)
 app.MapPost("/admin/users/organizer", async (CreateOrganizerRequest req, AuthDbContext db) =>
 {
     if (await db.Users.AnyAsync(u => u.Email == req.Email || u.Username == req.Username))

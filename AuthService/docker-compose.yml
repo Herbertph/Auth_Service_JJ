@@ -1,30 +1,46 @@
-version: "3.9"
 services:
   auth-db:
     image: postgres:16
-    container_name: auth_db
+    container_name: authservice-auth-db
     environment:
       POSTGRES_DB: authdb
       POSTGRES_USER: authuser
       POSTGRES_PASSWORD: authpass
     ports:
-      - "5433:5432"
+      - "5440:5432"
     volumes:
       - authdb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authuser -d authdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   auth-service:
-    build: ./AuthService
-    depends_on: [auth-db]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: authservice-auth-service
+    depends_on:
+      auth-db:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+
+      # DB
       ConnectionStrings__Default: "Host=auth-db;Port=5432;Database=authdb;Username=authuser;Password=authpass"
+
+      # JWT
       Jwt__Issuer: "jj-arena-auth"
       Jwt__Audience: "jj-arena"
-      Jwt__Key: "change-me-in-prod"
+      Jwt__Key: "c6b8f5a1a07a4b8a94a6e9c9b1fcb2d93a4d1e3f6c8e0a2b7d9c1f4e6a8b0d2f"
+
+      # Seed (dev)
       Seed__AdminEmail: "admin@jj-arena.com"
       Seed__AdminPassword: "ChangeMe123!#"
     ports:
       - "8081:8080"
-    command: ["dotnet", "AuthService.dll"]
+
 volumes:
   authdb_data:
