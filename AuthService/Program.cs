@@ -8,11 +8,38 @@ using AuthService.Dtos;
 using AuthService.Options;
 using AuthService.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ---------- Helpers ----------
+static RouteHandlerBuilder WithJwtSecurity(RouteHandlerBuilder builder)
+{
+    return builder.WithOpenApi(op =>
+    {
+        op.Security = new List<OpenApiSecurityRequirement>
+        {
+            new()
+            {
+                {
+                    new OpenApiSecurityScheme
+                    {
+                        Reference = new OpenApiReference
+                        {
+                            Type = ReferenceType.SecurityScheme,
+                            Id = "Bearer"
+                        }
+                    },
+                    Array.Empty<string>()
+                }
+            }
+        };
+        return op;
+    });
+}
 
 // ---------- DbContext ----------
 var conn = builder.Configuration.GetConnectionString("Default")
@@ -35,7 +62,7 @@ var signingKey = new SymmetricSecurityKey(keyBytes);
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
   .AddJwtBearer(opt =>
   {
-      opt.RequireHttpsMetadata = !builder.Environment.IsDevelopment(); // HTTPS em prod
+      opt.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
       opt.TokenValidationParameters = new TokenValidationParameters
       {
           ValidateIssuerSigningKey = true,
@@ -77,13 +104,13 @@ builder.Services.AddSwaggerGen(c =>
         Scheme = "bearer",
         BearerFormat = "JWT",
         In = ParameterLocation.Header,
-        Description = "Informe: Bearer {seu_token}"
+        Description = "Informe apenas o token (sem a palavra Bearer)"
     };
     c.AddSecurityDefinition("Bearer", jwtScheme);
     c.AddSecurityRequirement(new OpenApiSecurityRequirement { [ jwtScheme ] = Array.Empty<string>() });
 });
 
-builder.Services.AddSingleton(jwtOpts);          // para DI direto
+builder.Services.AddSingleton(jwtOpts);
 builder.Services.AddSingleton<JwtTokenService>();
 
 var app = builder.Build();
@@ -92,9 +119,8 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
-    await db.Database.MigrateAsync(); // aplica migrações
+    await db.Database.MigrateAsync();
 
-    // seed admin (somente se não existir)
     var seed = app.Configuration.GetSection("Seed").Get<SeedOptions>();
     if (!string.IsNullOrWhiteSpace(seed?.AdminEmail) &&
         !await db.Users.AnyAsync(u => u.Email == seed.AdminEmail))
@@ -161,8 +187,6 @@ api.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenSe
         return Results.Unauthorized();
 
     var access = jwt.CreateAccessToken(user);
-
-    // Refresh token: ID + segredo (hash guardado no banco)
     var tokenId = Guid.NewGuid();
     var secret  = Guid.NewGuid().ToString("N");
     var composite = $"{tokenId:N}.{secret}";
@@ -179,8 +203,9 @@ api.MapPost("/auth/login", async (LoginRequest req, AuthDbContext db, JwtTokenSe
     return Results.Ok(new AuthResponse(access, composite));
 });
 
-api.MapPost("/auth/refresh", async (string refreshToken, AuthDbContext db, JwtTokenService jwt, JwtOptions opts) =>
+api.MapPost("/auth/refresh", async ([FromBody] TokenRequest req, AuthDbContext db, JwtTokenService jwt, JwtOptions opts) =>
 {
+    var refreshToken = req.RefreshToken;
     if (string.IsNullOrWhiteSpace(refreshToken)) return Results.Unauthorized();
 
     var parts = refreshToken.Split('.', 2);
@@ -195,9 +220,7 @@ api.MapPost("/auth/refresh", async (string refreshToken, AuthDbContext db, JwtTo
     if (!BCrypt.Net.BCrypt.Verify(secret, record.TokenHash))
         return Results.Unauthorized();
 
-    // ROTATION: revoga o atual e emite novo par
     record.RevokedAt = DateTime.UtcNow;
-
     var newAccess = jwt.CreateAccessToken(record.User);
     var newId = Guid.NewGuid();
     var newSecret = Guid.NewGuid().ToString("N");
@@ -215,20 +238,24 @@ api.MapPost("/auth/refresh", async (string refreshToken, AuthDbContext db, JwtTo
     return Results.Ok(new { accessToken = newAccess, refreshToken = newComposite });
 });
 
-// revoga 1 sessão (precisa estar autenticado)
-api.MapPost("/auth/logout", async (string refreshToken, AuthDbContext db) =>
+WithJwtSecurity(
+api.MapPost("/auth/logout", async ([FromBody] TokenRequest req, ClaimsPrincipal principal, AuthDbContext db) =>
 {
-    var parts = refreshToken.Split('.', 2);
+    var parts = req.RefreshToken.Split('.', 2);
     if (parts.Length != 2 || !Guid.TryParseExact(parts[0], "N", out var tokenId)) return Results.Unauthorized();
 
-    var rec = await db.RefreshTokens.FirstOrDefaultAsync(r => r.Id == tokenId);
+    var sub = principal.FindFirstValue("sub");
+    if (sub is null) return Results.Unauthorized();
+    var userId = Guid.Parse(sub);
+
+    var rec = await db.RefreshTokens.FirstOrDefaultAsync(r => r.Id == tokenId && r.UserId == userId);
     if (rec is not null && rec.RevokedAt is null) rec.RevokedAt = DateTime.UtcNow;
 
     await db.SaveChangesAsync();
     return Results.Ok();
-}).RequireAuthorization();
+}).RequireAuthorization());
 
-// revoga TODAS as sessões do usuário
+WithJwtSecurity(
 api.MapPost("/auth/logout-all", async (ClaimsPrincipal principal, AuthDbContext db) =>
 {
     var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -240,9 +267,9 @@ api.MapPost("/auth/logout-all", async (ClaimsPrincipal principal, AuthDbContext 
 
     await db.SaveChangesAsync();
     return Results.Ok(new { revoked = tokens.Count });
-}).RequireAuthorization();
+}).RequireAuthorization());
 
-// whoami
+WithJwtSecurity(
 api.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
 {
     var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -253,9 +280,9 @@ api.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
     if (u is null) return Results.NotFound();
 
     return Results.Ok(new { u.Id, u.Email, u.Username, role = u.Role.ToString(), u.CreatedAt });
-}).RequireAuthorization();
+}).RequireAuthorization());
 
-// -------- Admin / Roles test --------
+WithJwtSecurity(
 api.MapPost("/admin/users/organizer", async (CreateOrganizerRequest req, AuthDbContext db) =>
 {
     if (await db.Users.AnyAsync(u => u.Email == req.Email || u.Username == req.Username))
@@ -272,12 +299,20 @@ api.MapPost("/admin/users/organizer", async (CreateOrganizerRequest req, AuthDbC
     db.Users.Add(user);
     await db.SaveChangesAsync();
     return Results.Created($"/api/v1/users/{user.Id}", new { user.Id, user.Email, user.Username, role = user.Role.ToString() });
-}).RequireAuthorization("AdminOnly");
+}).RequireAuthorization("AdminOnly"));
 
-api.MapGet("/admin/ping", () => Results.Ok(new { ok = true })).RequireAuthorization("AdminOnly");
-api.MapGet("/org/ping", () => Results.Ok(new { ok = true })).RequireAuthorization("OrganizerOrAdmin");
+WithJwtSecurity(
+api.MapGet("/admin/ping", () => Results.Ok(new { ok = true }))
+   .RequireAuthorization("AdminOnly"));
+
+WithJwtSecurity(
+api.MapGet("/org/ping", () => Results.Ok(new { ok = true }))
+   .RequireAuthorization("OrganizerOrAdmin"));
 
 app.Run();
 
 // Habilita WebApplicationFactory<> em testes
 namespace AuthService { public partial class Program {} }
+
+// DTO p/ body de refresh/logout
+public record TokenRequest(string RefreshToken);
