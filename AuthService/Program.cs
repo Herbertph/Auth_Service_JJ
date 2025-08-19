@@ -244,7 +244,7 @@ api.MapPost("/auth/logout", async ([FromBody] TokenRequest req, ClaimsPrincipal 
     var parts = req.RefreshToken.Split('.', 2);
     if (parts.Length != 2 || !Guid.TryParseExact(parts[0], "N", out var tokenId)) return Results.Unauthorized();
 
-    var sub = principal.FindFirstValue("sub");
+var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
     if (sub is null) return Results.Unauthorized();
     var userId = Guid.Parse(sub);
 
