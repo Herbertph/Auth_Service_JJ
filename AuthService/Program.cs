@@ -44,7 +44,20 @@ static RouteHandlerBuilder WithJwtSecurity(RouteHandlerBuilder builder)
 // ---------- DbContext ----------
 var conn = builder.Configuration.GetConnectionString("Default")
            ?? builder.Configuration["ConnectionStrings:Default"];
-builder.Services.AddDbContext<AuthDbContext>(opt => opt.UseNpgsql(conn));
+
+// Permite usar InMemory quando em testes de integração
+var useInMemory = builder.Configuration.GetValue<bool>("Testing:UseInMemory");
+
+if (useInMemory)
+{
+    builder.Services.AddDbContext<AuthDbContext>(opt =>
+        opt.UseInMemoryDatabase("AuthTestsDb"));
+}
+else
+{
+    builder.Services.AddDbContext<AuthDbContext>(opt =>
+        opt.UseNpgsql(conn));
+}
 
 // ---------- Options ----------
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
@@ -119,7 +132,16 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
-    await db.Database.MigrateAsync();
+
+    if (useInMemory)
+    {
+        // garante o banco em memória
+        await db.Database.EnsureCreatedAsync();
+    }
+    else
+    {
+        await db.Database.MigrateAsync();
+    }
 
     var seed = app.Configuration.GetSection("Seed").Get<SeedOptions>();
     if (!string.IsNullOrWhiteSpace(seed?.AdminEmail) &&
@@ -238,14 +260,18 @@ api.MapPost("/auth/refresh", async ([FromBody] TokenRequest req, AuthDbContext d
     return Results.Ok(new { accessToken = newAccess, refreshToken = newComposite });
 });
 
+// LOGOUT (body + checa dono do token) — exige Bearer
 WithJwtSecurity(
 api.MapPost("/auth/logout", async ([FromBody] TokenRequest req, ClaimsPrincipal principal, AuthDbContext db) =>
 {
     var parts = req.RefreshToken.Split('.', 2);
-    if (parts.Length != 2 || !Guid.TryParseExact(parts[0], "N", out var tokenId)) return Results.Unauthorized();
+    if (parts.Length != 2 || !Guid.TryParseExact(parts[0], "N", out var tokenId))
+        return Results.Unauthorized();
 
-var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
+    // 👇 Fallback: "sub" OU NameIdentifier
+    var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes.NameIdentifier);
     if (sub is null) return Results.Unauthorized();
+
     var userId = Guid.Parse(sub);
 
     var rec = await db.RefreshTokens.FirstOrDefaultAsync(r => r.Id == tokenId && r.UserId == userId);
@@ -255,6 +281,7 @@ var sub = principal.FindFirstValue("sub") ?? principal.FindFirstValue(ClaimTypes
     return Results.Ok();
 }).RequireAuthorization());
 
+// LOGOUT-ALL — exige Bearer
 WithJwtSecurity(
 api.MapPost("/auth/logout-all", async (ClaimsPrincipal principal, AuthDbContext db) =>
 {
@@ -269,6 +296,7 @@ api.MapPost("/auth/logout-all", async (ClaimsPrincipal principal, AuthDbContext 
     return Results.Ok(new { revoked = tokens.Count });
 }).RequireAuthorization());
 
+// whoami — exige Bearer
 WithJwtSecurity(
 api.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
 {
@@ -282,6 +310,7 @@ api.MapGet("/auth/me", async (ClaimsPrincipal principal, AuthDbContext db) =>
     return Results.Ok(new { u.Id, u.Email, u.Username, role = u.Role.ToString(), u.CreatedAt });
 }).RequireAuthorization());
 
+// -------- Admin / Roles test --------
 WithJwtSecurity(
 api.MapPost("/admin/users/organizer", async (CreateOrganizerRequest req, AuthDbContext db) =>
 {
